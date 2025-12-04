@@ -1,59 +1,87 @@
 %% Leer un archivo de video, modificar, escribir en otro
-videoHandleIn = VideoReader('ejemplo.mp4');        % de donde leeremos
-videoHandleOut = VideoWriter('salida.avi');   % a donde escribiremos
-videoHandleOut.Quality=95;
-videoHandleOut.FrameRate = videoHandleIn.FrameRate; % heredamos el frame rate
+videoHandleIn = VideoReader('ejemplo.mp4');
+videoHandleOut = VideoWriter('salida.avi');
+videoHandleOut.Quality = 95;
+videoHandleOut.FrameRate = videoHandleIn.FrameRate;
+open(videoHandleOut);
 
-open(videoHandleOut); % creamos realmente el fichero de salida
+%% Cargar el banner y su máscara
+[banner, ~, banner_mask] = imread('banner.png');
+% Si la máscara no viene con el PNG, créala (degradado horizontal como ejemplo)
+if isempty(banner_mask)
+    banner_mask = uint8(linspace(1, 255, size(banner, 2)));
+    banner_mask = repmat(banner_mask, [size(banner, 1), 1]);
+end
 
-%%
+%% Inicialización de ROI
 frameBefore = readFrame(videoHandleIn);
-[BW, xind, yind] = roipoly(frameBefore); % se pide al usuario que dibuje un poligono alrededor de la zona de interés
-R = round(sqrt((max(xind)-min(xind))/2 + (max(yind)-min(yind))/2)); % calculamos automaticamente una gaussiana adecuada
-D = 2*R+1; % lo doblamos y nos aseguramos de que sea impar
+[BW, xind, yind] = roipoly(frameBefore);
+R = round(sqrt((max(xind)-min(xind))/2 + (max(yind)-min(yind))/2));
+D = 2*R+1;
 g = fspecial('gaussian', D, R/3);
 BWfiltered = imfilter(double(BW), g);
 frameBeforeROI = im2uint8(im2double(frameBefore).*BWfiltered);
-
-roi = images.roi.Polygon;  % creamos el objeto ROI que luego necesitaremos para actualizar máscara y posición de la ROI
+roi = images.roi.Polygon;
 roi.Position = [xind, yind];
 
-%%
-pointsBefore = detectHarrisFeatures(rgb2gray(frameBeforeROI)); % Llamar a Harris limitándolo a que analice la imagen en la ROI, esto es, frameBeforeROI
-[featuresBefore,validPointsBefore] = extractFeatures(rgb2gray(frameBeforeROI), pointsBefore); % extraer las características
+%% Detección inicial de características
+pointsBefore = detectHarrisFeatures(rgb2gray(frameBeforeROI));
+[featuresBefore, validPointsBefore] = extractFeatures(rgb2gray(frameBeforeROI), pointsBefore);
 
-
-%%
-while hasFrame(videoHandleIn)  % mientras hayan frames que procesar
-   frameNext = readFrame(videoHandleIn); % sacamos el frame actual como imagen
-   
+%% Procesamiento frame por frame
+while hasFrame(videoHandleIn)
+   frameNext = readFrame(videoHandleIn);
    frameNextROI = im2uint8(im2double(frameNext).*BWfiltered);
-   pointsNext = detectHarrisFeatures(rgb2gray(frameNextROI)); % igual que linea 22 pero para el nuevo frame
-   [featuresNext,validPointsNext] = extractFeatures(rgb2gray(frameNextROI), pointsNext); % igual que línea 23 pero para el nuevo frame
-
-   indexPairs = matchFeatures(featuresBefore, featuresNext, 'Unique', true); % llamar a emparejamiento de características
-   matchedPointsB = validPointsBefore(indexPairs(:,1)); % qué puntos de valid points before fueron emparejados
-   matchedPointsN = validPointsNext(indexPairs(:,2)); % qué puntos de valid points next fueron emparejados
-   if matchedPointsN.Count < 3 % si no tenemos suficientes para montar el modelo abortamos
+   
+   % Detección en frame actual
+   pointsNext = detectHarrisFeatures(rgb2gray(frameNextROI));
+   [featuresNext, validPointsNext] = extractFeatures(rgb2gray(frameNextROI), pointsNext);
+   
+   % Emparejamiento
+   indexPairs = matchFeatures(featuresBefore, featuresNext, 'Unique', true);
+   matchedPointsB = validPointsBefore(indexPairs(:,1));
+   matchedPointsN = validPointsNext(indexPairs(:,2));
+   
+   % Verificar suficientes puntos
+   if matchedPointsN.Count < 4  % Mínimo 4 para proyectiva
+       warning('Insuficientes puntos. Abortando.');
        break;
    end
-
-   showMatchedFeatures(frameBeforeROI,frameNextROI, matchedPointsB, matchedPointsN);
-   imageCapture = getframe(gcf);
-   legend('frame anterior','frame siguiente'); pause(1/videoHandleIn.FrameRate);
    
-   tform = estimateGeometricTransform(matchedPointsB, matchedPointsN, 'projective'); % help estimateGeometricTransform
-   [xind,yind] = transformPointsForward(tform, xind, yind); % help transformPoints ¿forward o inverse?
-
-   roi.Position = [xind, yind];                    % actualizamos valores para... 
-   BW = roi.createMask(rgb2gray(frameNext));     % comenzar un nuevo ciclo...
-   BWfiltered = imfilter(double(BW), g);           % donde el frame actual pasar a ...
-   frameBeforeROI = im2uint8(im2double(frameNext).*BWfiltered); % ser el frame anterior
+   % Estimación de transformación
+   tform = estimateGeometricTransform(matchedPointsB, matchedPointsN, 'projective');
+   [xind, yind] = transformPointsForward(tform, xind, yind);
+   
+   % Calcular el centro de la ROI para posicionar el banner
+   centerX = round(mean(xind));
+   centerY = round(mean(yind));
+   
+   % Calcular posición superior-izquierda del banner (centrado en la ROI)
+   bannerX = centerX - round(size(banner, 2)/2);
+   bannerY = centerY - round(size(banner, 1)/2);
+   
+   % Aplicar el banner al frame
+   frameWithBanner = maskBanner(frameNext, banner, banner_mask, bannerX, bannerY);
+   
+   % Visualización (opcional: mostrar con banner o sin banner)
+   showMatchedFeatures(frameBeforeROI, frameNextROI, matchedPointsB, matchedPointsN);
+   imageCapture = getframe(gcf);
+   legend('frame anterior', 'frame siguiente'); 
+   pause(1/videoHandleIn.FrameRate);
+   
+   % Actualizar máscara para siguiente iteración
+   roi.Position = [xind, yind];
+   BW = roi.createMask(rgb2gray(frameNext));
+   BWfiltered = imfilter(double(BW), g);
+   frameBeforeROI = im2uint8(im2double(frameNext).*BWfiltered);
+   
+   % Actualizar características
    pointsBefore = pointsNext;
    featuresBefore = featuresNext;
    validPointsBefore = validPointsNext;
-
-   writeVideo(videoHandleOut,imageCapture.cdata); % lo escribimos
+   
+   % Escribir el frame CON el banner (no la visualización de matching)
+   writeVideo(videoHandleOut, frameWithBanner);
 end
 
-close(videoHandleOut);  % cerramos el video que estamos creando
+close(videoHandleOut);
